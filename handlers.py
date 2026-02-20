@@ -147,8 +147,9 @@ def greetings_handler(c: Cardinal, e: NewMessageEvent | LastChatMessageChangedEv
     else:
         obj = e.chat
         chat_id, chat_name, mtype, its_me, badge = obj.id, obj.name, obj.last_message_type, not obj.unread, None
-    if any([c.MAIN_CFG["Greetings"].getboolean("onlyNewChats") and
-            (chat_id <= c.greeting_chat_id_threshold or chat_id in c.greeting_threshold_chat_ids),
+    is_old_chat = (chat_id <= c.greeting_chat_id_threshold or chat_id in c.greeting_threshold_chat_ids)
+
+    if any([c.MAIN_CFG["Greetings"].getboolean("onlyNewChats") and is_old_chat,
             time.time() - c.old_users.get(chat_id, 0) < float(
                 c.MAIN_CFG["Greetings"]["greetingsCooldown"]) * 24 * 60 * 60,
             its_me, mtype in (MessageTypes.DEAR_VENDORS, MessageTypes.ORDER_CONFIRMED_BY_ADMIN), badge is not None,
@@ -198,6 +199,8 @@ def send_response_handler(c: Cardinal, e: NewMessageEvent | LastChatMessageChang
 
     mtext = mtext.replace("\n", "")
     if any([c.bl_response_enabled and username in c.blacklist, (command := mtext.strip().lower()) not in c.AR_CFG]):
+        return
+    if not c.AR_CFG[command].getboolean("enabled"):
         return
 
     logger.info(_("log_new_cmd", command, chat_name, chat_id))
@@ -407,7 +410,8 @@ def send_command_notification_handler(c: Cardinal, e: NewMessageEvent | LastChat
     if c.bl_cmd_notification_enabled and username in c.blacklist:
         return
     command = message_text.strip().lower()
-    if command not in c.AR_CFG or not c.AR_CFG[command].getboolean("telegramNotification"):
+    if (command not in c.AR_CFG or not c.AR_CFG[command].getboolean("telegramNotification")
+            or not c.AR_CFG[command].getboolean("enabled")):
         return
 
     if not c.AR_CFG[command].get("notificationText"):
@@ -494,35 +498,6 @@ def check_products_amount(config_obj: configparser.SectionProxy) -> int:
     return cardinal_tools.count_products(f"storage/products/{file_name}")
 
 
-def update_current_lots_handler(c: Cardinal, e: OrdersListChangedEvent):
-    logger.info("Получаю информацию о лотах...")  # locale
-    attempts = 3
-    while attempts:
-        try:
-            c.curr_profile = c.account.get_user(c.account.id)
-            c.curr_profile_last_tag = e.runner_tag
-            break
-        except:
-            logger.error("Произошла ошибка при получении информации о лотах.")  # locale
-            logger.debug("TRACEBACK", exc_info=True)
-            attempts -= 1
-            time.sleep(2)
-    else:
-        logger.error("Не удалось получить информацию о лотах: превышено кол-во попыток.")  # locale
-        return
-
-
-def update_profile_lots_handler(c: Cardinal, e: OrdersListChangedEvent):
-    """Обновляет лоты в c.profile"""
-    if c.curr_profile_last_tag != e.runner_tag or c.profile_last_tag == e.runner_tag:
-        return
-    c.profile_last_tag = e.runner_tag
-    lots = c.curr_profile.get_sorted_lots(1)
-
-    for lot_id, lot in lots.items():
-        c.profile.update_lot(lot)
-
-
 # Новый ордер (REGISTER_TO_NEW_ORDER)
 def log_new_order_handler(c: Cardinal, e: NewOrderEvent, *args):
     """
@@ -599,14 +574,22 @@ def send_new_order_notification_handler(c: Cardinal, e: NewOrderEvent, *args):
     text = _("ntfc_new_order", f"{utils.escape(e.order.description)}, {utils.escape(e.order.subcategory_name)}",
              e.order.buyer_username, f"{e.order.price} {e.order.currency}", e.order.id, delivery_info)
 
-    chat_id = c.account.get_chat_by_name(e.order.buyer_username, True).id
+    chat = c.account.get_chat_by_name(e.order.buyer_username)
+    if chat:
+        chat_id = chat.id
+    else:
+        chat_id = e.order.chat_id
     keyboard = keyboards.new_order(e.order.id, e.order.buyer_username, chat_id)
     Thread(target=c.telegram.send_notification, args=(text, keyboard, utils.NotificationTypes.new_order),
            daemon=True).start()
 
 
 def deliver_goods(c: Cardinal, e: NewOrderEvent, *args):
-    chat_id = c.account.get_chat_by_name(e.order.buyer_username).id
+    chat = c.account.get_chat_by_name(e.order.buyer_username)
+    if chat:
+        chat_id = chat.id
+    else:
+        chat_id = e.order.chat_id
     cfg_obj = getattr(e, "config_section_obj")
     delivery_text = cardinal_tools.format_order_text(cfg_obj["response"], e.order)
 
@@ -683,6 +666,33 @@ def send_delivery_notification_handler(c: Cardinal, e: NewOrderEvent):
     Thread(target=c.telegram.send_notification, args=(text,),
            kwargs={"notification_type": utils.NotificationTypes.delivery}, daemon=True).start()
 
+def update_current_lots(c: Cardinal, e: NewOrderEvent):
+    logger.info("Получаю информацию о лотах...")  # locale
+    attempts = 3
+    while attempts:
+        try:
+            c.curr_profile = c.account.get_user(c.account.id)
+            c.curr_profile_last_tag = e.runner_tag
+            break
+        except:
+            logger.error("Произошла ошибка при получении информации о лотах.")  # locale
+            logger.debug("TRACEBACK", exc_info=True)
+            attempts -= 1
+            time.sleep(2)
+    else:
+        logger.error("Не удалось получить информацию о лотах: превышено кол-во попыток.")  # locale
+        return
+
+
+def update_profile_lots(c: Cardinal, e: NewOrderEvent):
+    """Обновляет лоты в c.profile"""
+    if c.curr_profile_last_tag != e.runner_tag or c.profile_last_tag == e.runner_tag:
+        return
+    c.profile_last_tag = e.runner_tag
+    lots = c.curr_profile.get_sorted_lots(1)
+
+    for lot_id, lot in lots.items():
+        c.profile.update_lot(lot)
 
 def update_lot_state(cardinal: Cardinal, lot: types.LotShortcut, task: int) -> bool:
     """
@@ -698,17 +708,23 @@ def update_lot_state(cardinal: Cardinal, lot: types.LotShortcut, task: int) -> b
     while attempts:
         try:
             lot_fields = cardinal.account.get_lot_fields(lot.id)
-            if task == 1:
+            if lot_fields.auto_delivery:
+                # если включена автовыдача FunPay - не трогаем
+                return False
+            elif task == (1 if lot_fields.active else -1):
+                #если лот и так в нужном состоянии
+                return True
+            elif task == 1:
                 lot_fields.active = True
                 cardinal.account.save_lot(lot_fields)
-                logger.info(f"Восстановил лот $YELLOW{lot.description}$RESET.")  # locale
+                logger.info(f"Восстановил лот $YELLOW{lot.id} - {lot.description}$RESET.")  # locale
             elif task == -1:
                 lot_fields.active = False
                 cardinal.account.save_lot(lot_fields)
-                logger.info(f"Деактивировал лот $YELLOW{lot.description}$RESET.")  # locale
+                logger.info(f"Деактивировал лот $YELLOW{lot.id} - {lot.description}$RESET.")  # locale
             return True
         except Exception as e:
-            if isinstance(e, exceptions.RequestFailedError) and e.status_code == 404:
+            if isinstance(e, exceptions.LotParsingError):
                 logger.error(f"Произошла ошибка при изменении состояния лота $YELLOW{lot.description}$RESET:"  # locale
                              "лот не найден.")
                 return False
@@ -724,9 +740,10 @@ def update_lot_state(cardinal: Cardinal, lot: types.LotShortcut, task: int) -> b
 def update_lots_states(cardinal: Cardinal, event: NewOrderEvent):
     if not any([cardinal.autorestore_enabled, cardinal.autodisable_enabled]):
         return
-    if cardinal.curr_profile_last_tag != event.runner_tag or cardinal.last_state_change_tag == event.runner_tag:
+    curr_profile_tag = cardinal.curr_profile_last_tag
+    if cardinal.last_state_change_tag == curr_profile_tag:
         return
-
+    cardinal.last_state_change_tag = curr_profile_tag
     lots = cardinal.curr_profile.get_sorted_lots(1)
 
     deactivated = []
@@ -793,28 +810,38 @@ def update_lots_states(cardinal: Cardinal, event: NewOrderEvent):
 <code>{lots}</code>"""
         Thread(target=cardinal.telegram.send_notification, args=(text,),
                kwargs={"notification_type": utils.NotificationTypes.lots_restore}, daemon=True).start()
-    cardinal.last_state_change_tag = event.runner_tag
 
 
-def update_lots_state_handler(cardinal: Cardinal, event: NewOrderEvent, *args):
-    Thread(target=update_lots_states, args=(cardinal, event), daemon=True).start()
+def update_profiles_handler(cardinal: Cardinal, event: NewOrderEvent | OrdersListChangedEvent, *args):
+    """Обновляет информацию о профилях и состояния лотов в отдельном потоке."""
+    def f(c: Cardinal, e: NewOrderEvent):
+        update_current_lots(c, e)
+        update_profile_lots(c, e)
+        update_lots_states(c, e)
 
+    if event.runner_tag != cardinal.last_profile_refresh_event_tag:
+        cardinal.last_profile_refresh_event_tag = event.runner_tag
+        Thread(target=f, args=(cardinal, event), daemon=True).start()
 
 # BIND_TO_ORDER_STATUS_CHANGED
-def send_thank_u_message_handler(c: Cardinal, e: OrderStatusChangedEvent):
+def send_thank_u_message_handler(cardinal: Cardinal, event: OrderStatusChangedEvent):
     """
     Отправляет ответное сообщение на подтверждение заказа.
     """
-    if not c.MAIN_CFG["OrderConfirm"].getboolean("sendReply") or e.order.status is not types.OrderStatuses.CLOSED:
+    if not cardinal.MAIN_CFG["OrderConfirm"].getboolean("sendReply") or event.order.status is not types.OrderStatuses.CLOSED:
         return
 
-    text = cardinal_tools.format_order_text(c.MAIN_CFG["OrderConfirm"]["replyText"], e.order)
-    chat = c.account.get_chat_by_name(e.order.buyer_username, True)
-    logger.info(f"Пользователь $YELLOW{e.order.buyer_username}$RESET подтвердил выполнение заказа "  # locale
-                f"$YELLOW{e.order.id}.$RESET")  # locale
+    text = cardinal_tools.format_order_text(cardinal.MAIN_CFG["OrderConfirm"]["replyText"], event.order)
+    chat = cardinal.account.get_chat_by_name(event.order.buyer_username)
+    if chat:
+        chat_id = chat.id
+    else:
+        chat_id = event.order.chat_id
+    logger.info(f"Пользователь $YELLOW{event.order.buyer_username}$RESET подтвердил выполнение заказа "  # locale
+                f"$YELLOW{event.order.id}.$RESET")  # locale
     logger.info(f"Отправляю ответное сообщение ...")  # locale
-    Thread(target=c.send_message, args=(chat.id, text, e.order.buyer_username),
-           kwargs={'watermark': c.MAIN_CFG["OrderConfirm"].getboolean("watermark")}, daemon=True).start()
+    Thread(target=cardinal.send_message, args=(chat_id, text, event.order.buyer_username),
+           kwargs={'watermark': cardinal.MAIN_CFG["OrderConfirm"].getboolean("watermark")}, daemon=True).start()
 
 
 def send_order_confirmed_notification_handler(cardinal: Cardinal, event: OrderStatusChangedEvent):
@@ -824,12 +851,16 @@ def send_order_confirmed_notification_handler(cardinal: Cardinal, event: OrderSt
     if not event.order.status == types.OrderStatuses.CLOSED:
         return
 
-    chat = cardinal.account.get_chat_by_name(event.order.buyer_username, True)
+    chat = cardinal.account.get_chat_by_name(event.order.buyer_username)
+    if chat:
+        chat_id = chat.id
+    else:
+        chat_id = event.order.chat_id
     Thread(target=cardinal.telegram.send_notification,  # locale
            args=(
-               f"""🪙 Пользователь <a href="https://funpay.com/chat/?node={chat.id}">{event.order.buyer_username}</a> """
+               f"""🪙 Пользователь <a href="https://funpay.com/chat/?node={chat_id}">{event.order.buyer_username}</a> """
                f"""подтвердил выполнение заказа <code>{event.order.id}</code>. (<code>{event.order.price} {event.order.currency}</code>)""",
-               keyboards.new_order(event.order.id, event.order.buyer_username, chat.id),
+               keyboards.new_order(event.order.id, event.order.buyer_username, chat_id),
                utils.NotificationTypes.order_confirmed),
            daemon=True).start()
 
@@ -873,11 +904,11 @@ BIND_TO_NEW_MESSAGE = [log_msg_handler,
 
 BIND_TO_POST_LOTS_RAISE = [send_categories_raised_notification_handler]
 
-BIND_TO_ORDERS_LIST_CHANGED = [update_current_lots_handler, update_profile_lots_handler]
+# BIND_TO_ORDERS_LIST_CHANGED = [update_profiles_handler]
 
 BIND_TO_NEW_ORDER = [log_new_order_handler, setup_event_attributes_handler,
                      send_new_order_notification_handler, deliver_product_handler,
-                     update_lots_state_handler]
+                     update_profiles_handler]
 
 BIND_TO_ORDER_STATUS_CHANGED = [send_thank_u_message_handler, send_order_confirmed_notification_handler]
 
